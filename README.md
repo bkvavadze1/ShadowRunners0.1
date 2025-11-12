@@ -20,5 +20,3 @@ Dodge obstacles, slide under hazards, and sprint through a collapsing medieval c
 - **Language:** C#
 - **Packages:** Cinemachine, Input System
 - **Version Control:** Git (code-first; large art/audio excluded)
-
-## Project Structure (public repo)
