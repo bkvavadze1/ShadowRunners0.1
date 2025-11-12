@@ -1,0 +1,2337 @@
+using UnityEngine;
+using TMPro;
+using ShadowRunners.Gameplay; // GameManager, RunnerMotor
+using System;
+
+namespace ShadowRunners.Systems
+{
+    /// <summary>
+    /// Distance, best distance (saved), coins, and finals UI.
+    /// - Distance now accumulates from runner's actual Z movement (no ticking during pause/settings/countdown).
+    /// - Supports difficulty coin value, combo multiplier, and OnCoinsAdded event for UI/VFX.
+    /// </summary>
+    public class ScoreSystem : MonoBehaviour
+    {
+        public static ScoreSystem Instance { get; private set; }
+
+        // ---- Events ---------------------------------------------------------
+        /// <summary>Raised whenever coins increase. Argument is the delta added this call.</summary>
+        public static event Action<int> OnCoinsAdded;
+
+        // ---- Inspector ------------------------------------------------------
+        [Header("Runner Ref (for distance)")]
+        [Tooltip("RunnerMotor used to read current transform for distance accumulation.")]
+        public RunnerMotor runner;
+
+        [Header("HUD Texts")]
+        public TMP_Text txtDistance;   // e.g., "123 m"
+        public TMP_Text txtBest;       // e.g., "Best 456 m"
+        public TMP_Text txtCoins;      // e.g., "* 10"
+
+        [Header("Game Over Texts")]
+        public TMP_Text txtTitle;      // "Game Over"
+        public TMP_Text txtFinal;      // "Distance: 123 m"
+        public TMP_Text txtBestFinal;  // "Best: 456 m"
+        public TMP_Text txtCoinsFinal; // "Coins: 42"
+
+        [Header("Formatting")]
+        [Tooltip("Icon used before coins. Keep ASCII-safe to avoid missing glyphs.")]
+        public string coinIcon = "*";
+        [Tooltip("Meters suffix.")]
+        public string metersSuffix = " m";
+
+        [Header("Distance")]
+        [Tooltip("Clamp per-frame distance add to avoid spikes when resuming.")]
+        public float maxDeltaMetersPerFrame = 2.0f;
+
+        // ---- Runtime values -------------------------------------------------
+        public float distance { get; private set; }
+        public float bestDistance { get; private set; }
+        public int coins { get; private set; }
+
+        /// <summary>Current run distance in meters (read-only).</summary>
+        public float Distance => distance;
+
+        // Multipliers/values
+        float _comboMultiplier = 1f;  // from ComboSystem
+        int _difficultyCoinValue = 1; // 1/2/3 for easy/med/hard
+
+        // Internals
+        GameManager.GameState _lastState;
+        float _uiTick;
+
+        // Actual-movement distance tracking
+        float _lastRunnerZ;
+        bool _haveLastZ;
+
+        const string PP_BEST = "SR_BestDistance";
+
+        void Awake()
+        {
+            if (Instance && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+
+            bestDistance = PlayerPrefs.GetFloat(PP_BEST, 0f);
+
+            if (!runner) runner = FindObjectOfType<RunnerMotor>();
+        }
+
+        void OnEnable()
+        {
+            ResetRunValues();
+            RefreshTopHUD();
+            RefreshFinalHUD(clearOnly: true);
+
+            _lastState = GameManager.Instance ? GameManager.Instance.State : GameManager.GameState.Running;
+            ResetZAnchor();
+        }
+
+        void Update()
+        {
+            var gm = GameManager.Instance;
+            var state = gm ? gm.State : GameManager.GameState.Running;
+
+            // State transitions
+            if (_lastState != state)
+            {
+                if (state == GameManager.GameState.Running)
+                {
+                    // We’re (re)starting -> re-anchor Z so there’s no jump
+                    ResetZAnchor();
+                    RefreshFinalHUD(clearOnly: true);
+                }
+                else if (state == GameManager.GameState.GameOver)
+                {
+                    CommitBestIfAny();
+                    RefreshFinalHUD(clearOnly: false);
+                }
+                _lastState = state;
+            }
+
+            // Accumulate strictly from transform delta Z only while Running
+            if (state == GameManager.GameState.Running)
+                AccumulateDistanceFromTransform();
+
+            // Throttle HUD refresh (unscaled so UI stays responsive)
+            _uiTick += Time.unscaledDeltaTime;
+            if (_uiTick >= 0.1f)
+            {
+                RefreshTopHUD();
+                _uiTick = 0f;
+            }
+        }
+
+        // --------------------- Public API ------------------------------------
+
+        /// <summary>Set base coin value from Difficulty (e.g., 1/2/3 for Easy/Med/Hard).</summary>
+        public void SetDifficultyCoinValue(int value)
+        {
+            _difficultyCoinValue = Mathf.Max(1, value);
+        }
+
+        /// <summary>Called by ComboSystem to update coin multiplier.</summary>
+        public void SetMultiplier(float m)
+        {
+            _comboMultiplier = (m > 1f) ? m : 1f;
+        }
+
+        /// <summary>Coins gain (Difficulty base * Combo multiplier).</summary>
+        public void AddCoins(int value)
+        {
+            int add = Mathf.Max(0, value);
+            add *= Mathf.Max(1, _difficultyCoinValue);
+            add = Mathf.RoundToInt(add * _comboMultiplier);
+            if (add <= 0) return;
+
+            coins += add;
+
+            if (txtCoins) txtCoins.text = $"{coinIcon} {coins}";
+            OnCoinsAdded?.Invoke(add);
+        }
+
+        // Back-compat alias
+        public void AddCurrency(int value) => AddCoins(value);
+
+        /// <summary>Explicit reset when starting a fresh run (optional).</summary>
+        public void ResetRunValues()
+        {
+            distance = 0f;
+            coins = 0;
+            _comboMultiplier = 1f;
+            // keep bestDistance
+        }
+
+        /// <summary>Legacy hook some GameManagers call at game over.</summary>
+        public void OnRunEnded()
+        {
+            CommitBestIfAny();
+            RefreshFinalHUD(clearOnly: false);
+        }
+
+        // Aliases for older tools
+        public TMP_Text distanceText => txtDistance;
+        public TMP_Text bestText => txtBest;
+        public TMP_Text coinsText => txtCoins;
+        public TMP_Text statusText => null;
+        public TMP_Text finalDistanceText => txtFinal;
+        public TMP_Text finalBestText => txtBestFinal;
+        public TMP_Text finalCoinsText => txtCoinsFinal;
+
+        // --------------------- Internals -------------------------------------
+
+        void ResetZAnchor()
+        {
+            if (runner)
+            {
+                _lastRunnerZ = runner.transform.position.z;
+                _haveLastZ = true;
+            }
+            else
+            {
+                _haveLastZ = false;
+            }
+        }
+
+        void AccumulateDistanceFromTransform()
+        {
+            if (!runner) return;
+
+            float curZ = runner.transform.position.z;
+
+            if (!_haveLastZ)
+            {
+                _lastRunnerZ = curZ;
+                _haveLastZ = true;
+                return;
+            }
+
+            float dz = curZ - _lastRunnerZ;
+            _lastRunnerZ = curZ;
+
+            if (dz <= 0f) return; // not moving forward = no distance
+
+            // Clamp per-frame to avoid spikes on resume
+            float add = Mathf.Clamp(dz, 0f, maxDeltaMetersPerFrame);
+            distance += add;
+
+            if (distance > bestDistance) bestDistance = distance;
+        }
+
+        void RefreshTopHUD()
+        {
+            if (txtDistance) txtDistance.text = Mathf.FloorToInt(distance).ToString() + metersSuffix;
+            if (txtBest) txtBest.text = "Best " + Mathf.FloorToInt(bestDistance).ToString() + metersSuffix;
+            if (txtCoins) txtCoins.text = $"{coinIcon} {coins}";
+        }
+
+        void RefreshFinalHUD(bool clearOnly)
+        {
+            if (txtTitle) txtTitle.text = clearOnly ? "" : "Game Over";
+            if (txtFinal) txtFinal.text = clearOnly ? "" : $"Distance: {Mathf.FloorToInt(distance)}{metersSuffix}";
+            if (txtBestFinal) txtBestFinal.text = clearOnly ? "" : $"Best: {Mathf.FloorToInt(bestDistance)}{metersSuffix}";
+            if (txtCoinsFinal) txtCoinsFinal.text = clearOnly ? "" : $"Coins: {coins}";
+        }
+
+        void CommitBestIfAny()
+        {
+            float saved = PlayerPrefs.GetFloat(PP_BEST, 0f);
+            if (bestDistance > saved)
+            {
+                PlayerPrefs.SetFloat(PP_BEST, bestDistance);
+                PlayerPrefs.Save();
+            }
+        }
+    }
+}
+
+
+using UnityEngine;
+using static ShadowRunners.Gameplay.GameManager;
+using ShadowRunners.Feel;            // (events)
+using ShadowRunners.Systems;        // GlobalRunHold
+
+namespace ShadowRunners.Gameplay
+{
+    [RequireComponent(typeof(CharacterController))]
+    public class RunnerMotor : MonoBehaviour
+    {
+        [Header("Forward Motion (world +Z)")]
+        public float forwardSpeed = 8f;
+        public float maxSpeed = 18f;
+        public float acceleration = 0.6f;
+
+        [Header("Lane Movement (world X)")]
+        public float laneOffset = 2f;
+        public float laneChangeSpeed = 28f;
+        [SerializeField] private int lane = 0;
+
+        [Header("Jump / Gravity (world Y)")]
+        public float jumpForce = 8f;
+        public float gravity = 30f;
+        public float maxFallSpeed = 60f;
+        private float _yVel;
+        private bool _jumping;
+        private bool _jumpQueued;
+
+        [Header("Slide / Roll")]
+        public float slideDuration = 0.8f;
+        public float slideHeight = 0.9f;
+        public float slideCenterDown = 0.4f;
+        private bool _sliding;
+        private float _slideEndTime;
+        private bool _slideQueued;
+
+        [Header("Animation")]
+        public Animator anim;
+        public string jumpTrigger = "Jump";
+        public string slideTrigger = "Slide";
+
+        private CharacterController _cc;
+        private PowerupController _powerups;
+        private SwipeInput _swipe;
+
+        private float _baseX;
+        private float _origHeight;
+        private Vector3 _origCenter;
+
+        private int _lastLRFrame = -99999;
+        private float _armAtTime;
+
+        void OnValidate()
+        {
+            gravity = Mathf.Abs(gravity);
+            maxFallSpeed = Mathf.Abs(maxFallSpeed);
+            laneOffset = Mathf.Abs(laneOffset);
+            slideDuration = Mathf.Max(0.1f, slideDuration);
+        }
+
+        void Awake()
+        {
+            _cc = GetComponent<CharacterController>();
+            _powerups = GetComponent<PowerupController>();
+
+            _baseX = transform.position.x;
+            _origHeight = _cc.height;
+            _origCenter = _cc.center;
+
+            if (!anim) anim = GetComponentInChildren<Animator>();
+            if (anim)
+            {
+                anim.applyRootMotion = false;
+                if (!string.IsNullOrEmpty(jumpTrigger)) anim.ResetTrigger(jumpTrigger);
+                if (!string.IsNullOrEmpty(slideTrigger)) anim.ResetTrigger(slideTrigger);
+            }
+
+            var autoSwipe = GetComponent<SwipeInput>();
+            if (autoSwipe) HookInput(autoSwipe);
+
+            _armAtTime = Time.time + 0.25f;
+            _jumpQueued = _slideQueued = false;
+        }
+
+        void Start()
+        {
+            if (anim && anim.runtimeAnimatorController != null)
+            {
+                anim.Rebind();
+                anim.Update(0f);
+            }
+        }
+
+        void OnEnable()
+        {
+            if (_swipe != null) AttachSwipe(_swipe);
+        }
+
+        void OnDisable()
+        {
+            DetachSwipe(_swipe);
+        }
+
+        void OnDestroy()
+        {
+            UnhookInput();
+        }
+
+        public void HookInput(SwipeInput input)
+        {
+            if (input == _swipe) return;
+            UnhookInput();
+            _swipe = input;
+            AttachSwipe(_swipe);
+        }
+
+        public void UnhookInput()
+        {
+            DetachSwipe(_swipe);
+            _swipe = null;
+        }
+
+        private void AttachSwipe(SwipeInput s)
+        {
+            if (!s) return;
+            DetachSwipe(s);
+            s.OnSwipeLeft += HandleSwipeLeft;
+            s.OnSwipeRight += HandleSwipeRight;
+            s.OnSwipeUp += HandleSwipeUp;
+            s.OnSwipeDown += HandleSwipeDown;
+        }
+
+        private void DetachSwipe(SwipeInput s)
+        {
+            if (!s) return;
+            s.OnSwipeLeft -= HandleSwipeLeft;
+            s.OnSwipeRight -= HandleSwipeRight;
+            s.OnSwipeUp -= HandleSwipeUp;
+            s.OnSwipeDown -= HandleSwipeDown;
+        }
+
+        bool Armed()
+        {
+            var gm = GameManager.Instance;
+            bool running = (gm == null || gm.State == GameState.Running);
+            return running && Time.time >= _armAtTime;
+        }
+
+        void Update()
+        {
+            // >>> HARD HOLD GUARD <<<
+            if (GlobalRunHold.Held) return;
+
+            var gm = GameManager.Instance;
+            if (gm && gm.State != GameState.Running) return;
+
+            // ---------- Forward (Z) ----------
+            float speedMult = _powerups ? _powerups.CurrentSpeedMultiplier : 1f;
+            forwardSpeed = Mathf.Min(maxSpeed, forwardSpeed + acceleration * Time.deltaTime);
+            float dz = (forwardSpeed * speedMult) * Time.deltaTime;
+
+            // ---------- Lateral (X) ----------
+            float targetX = _baseX + lane * laneOffset;
+            float currentX = transform.position.x;
+            float maxStep = laneChangeSpeed * (_powerups ? _powerups.CurrentLaneChangeMultiplier : 1f) * Time.deltaTime;
+            float dx = Mathf.Clamp(targetX - currentX, -maxStep, maxStep);
+
+            // ---------- Vertical (Y) ----------
+            if (_cc.isGrounded)
+            {
+                if (_jumping && _yVel <= 0f) _jumping = false;
+                _yVel = Mathf.Min(_yVel, -2f);
+
+                if (Armed())
+                {
+                    if (_slideQueued && !_sliding)
+                    {
+                        _slideQueued = false;
+                        StartSlide();
+                    }
+                    if (_jumpQueued && !_sliding)
+                    {
+                        _jumpQueued = false;
+                        _jumping = true;
+                        _yVel = jumpForce;
+                        if (anim && anim.runtimeAnimatorController != null && !string.IsNullOrEmpty(jumpTrigger))
+                            anim.SetTrigger(jumpTrigger);
+
+                        GameFeelBus.RaiseJump(); // feel event
+                    }
+                }
+                else
+                {
+                    _jumpQueued = _slideQueued = false;
+                }
+            }
+            else
+            {
+                _yVel -= gravity * Time.deltaTime;
+                if (_yVel < -maxFallSpeed) _yVel = -maxFallSpeed;
+            }
+
+            float dy = _yVel * Time.deltaTime;
+
+            // ---------- Move once ----------
+            Vector3 delta = new Vector3(dx, dy, dz);
+            _cc.Move(delta);
+
+            // ---------- Slide timer ----------
+            if (_sliding && Time.time >= _slideEndTime)
+                EndSlide();
+        }
+
+        void HandleSwipeLeft()
+        {
+            if (!Armed()) return;
+            if (Time.frameCount == _lastLRFrame) return;
+            _lastLRFrame = Time.frameCount;
+            lane = Mathf.Max(-1, lane - 1);
+        }
+
+        void HandleSwipeRight()
+        {
+            if (!Armed()) return;
+            if (Time.frameCount == _lastLRFrame) return;
+            _lastLRFrame = Time.frameCount;
+            lane = Mathf.Min(1, lane + 1);
+        }
+
+        void HandleSwipeUp()
+        {
+            if (!Armed()) return;
+            _jumpQueued = true;
+        }
+
+        void HandleSwipeDown()
+        {
+            if (!Armed()) return;
+            if (_cc.isGrounded) _slideQueued = true;
+            else _yVel = Mathf.Min(_yVel, 0f);
+        }
+
+        void StartSlide()
+        {
+            _sliding = true;
+            _slideEndTime = Time.time + slideDuration;
+
+            _cc.height = slideHeight;
+            _cc.center = new Vector3(_origCenter.x, _origCenter.y - slideCenterDown, _origCenter.z);
+
+            if (anim && anim.runtimeAnimatorController != null && !string.IsNullOrEmpty(slideTrigger))
+                anim.SetTrigger(slideTrigger);
+
+            GameFeelBus.RaiseSlide(); // feel event
+        }
+
+        void EndSlide()
+        {
+            _sliding = false;
+            _cc.height = _origHeight;
+            _cc.center = _origCenter;
+        }
+
+        void OnControllerColliderHit(ControllerColliderHit hit)
+        {
+            if (!hit.collider) return;
+
+            int obstacleLayer = LayerMask.NameToLayer("Obstacle");
+            bool isObstacle =
+                (obstacleLayer >= 0 && hit.collider.gameObject.layer == obstacleLayer) ||
+                hit.collider.CompareTag("Obstacle");
+
+            if (!isObstacle) return;
+
+            if (_powerups && _powerups.IgnoreCollisions)
+                return;
+
+            if (_powerups && _powerups.TryAbsorbShieldHit())
+            {
+                GameObject target = FindObstacleRoot(hit.collider);
+                if (!target) target = hit.collider.gameObject;
+
+                GameFeelBus.RaiseShieldAbsorb(target);
+                Debug.Log("[RunnerMotor] Shield absorbed hit, obstacle neutralized");
+                NeutralizeObstacle(target);
+                return;
+            }
+
+            Debug.Log("[RunnerMotor] Fatal hit! Game Over");
+            var gm = GameManager.Instance;
+            if (gm != null) gm.PlayerHitObstacle();
+        }
+
+        GameObject FindObstacleRoot(Collider col)
+        {
+            if (col == null) return null;
+            Transform t = col.transform;
+            int guard = 0;
+            while (t != null && guard++ < 6)
+            {
+                if (t.GetComponent<CharacterController>() != null) break;
+                if (t.GetComponent<TrackManager>() != null) break;
+                if (t.GetComponent<TileController>() != null) break;
+                if (t.CompareTag("Obstacle")) break;
+                t = t.parent;
+            }
+            if (t != null && t.CompareTag("Obstacle")) return t.gameObject;
+            return col.gameObject;
+        }
+
+        void NeutralizeObstacle(GameObject target)
+        {
+            if (!target) return;
+            foreach (var c in target.GetComponentsInChildren<Collider>()) c.enabled = false;
+            foreach (var r in target.GetComponentsInChildren<Renderer>()) r.enabled = false;
+            Destroy(target, 0.75f);
+        }
+    }
+}
+
+
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace ShadowRunners.Gameplay
+{
+    public class TrackManager : MonoBehaviour
+    {
+        [Header("Refs")]
+        public Transform runner;
+
+        // Single-prefab fallback (optional)
+        public GameObject groundTilePrefab;
+
+        // Multiple variants (A, B, C, ...). If set, takes priority over groundTilePrefab.
+        [Tooltip("Drag prefab assets from Project here (not scene clones).")]
+        public GameObject[] groundTilePrefabs;
+
+        [Header("Layout")]
+        [Tooltip("Z-length of a single tile (meters). Must match the prefab's length (e.g., 36).")]
+        public float tileLength = 36f;
+        [Tooltip("How many tiles to spawn at start (ahead).")]
+        public int initialTiles = 8;
+        [Tooltip("How many starting tiles have no obstacles/pickups.")]
+        public int safeTiles = 2;
+
+        [Header("Variant Rotation")]
+        [Tooltip("Repeat each variant this many times before switching: A×N, B×N, C×N…")]
+        public int variantBatchCount = 5;
+
+        [Header("Recycle")]
+        [Tooltip("If ON, when a tile is recycled we spawn a NEW variant prefab instead of reusing the old one. Keeps A×N, B×N… even with small initialTiles.")]
+        public bool respawnVariantOnRecycle = true;
+
+        [Header("Obstacles")]
+        public GameObject[] obstaclePrefabs;
+        [Range(0f, 1f)] public float obstacleChancePerRow = 0.6f;
+
+        [Header("Coins")]
+        public GameObject[] coinPrefabs;
+        [Range(0f, 1f)] public float coinChancePerRow = 0.5f;
+
+        [Header("Power-ups (per tile chance)")]
+        public GameObject magnetPrefab;
+        [Range(0f, 1f)] public float magnetChancePerTile = 0.12f;
+
+        public GameObject shieldPrefab;
+        [Range(0f, 1f)] public float shieldChancePerTile = 0.08f;
+
+        public GameObject dashPrefab;
+        [Range(0f, 1f)] public float dashChancePerTile = 0.08f;
+
+        public GameObject cloakPrefab;
+        [Range(0f, 1f)] public float cloakChancePerTile = 0.08f;
+
+        [Header("Debug")]
+        public bool debugVariantPicks = false;
+
+        // ---- internals ----
+        readonly Queue<Transform> _tiles = new();
+        float _spawnZ;
+        System.Random _rng;
+
+        // Variant rotation (deterministic)
+        int _variantIndex = -1;        // first GetNext will advance to 0
+        int _variantCountInBatch = 0;  // how many times current variant has been used
+        int _spawnCount = 0;
+
+        void Awake()
+        {
+            _rng = new System.Random();
+
+            if (!runner)
+            {
+                var rm = FindObjectOfType<RunnerMotor>();
+                if (rm) runner = rm.transform;
+            }
+        }
+
+        void Start()
+        {
+            _spawnZ = 0f;
+            for (int i = 0; i < initialTiles; i++)
+                SpawnTile(i < safeTiles);
+        }
+
+        void Update()
+        {
+            if (_tiles.Count == 0 || runner == null) return;
+
+            Transform first = _tiles.Peek();
+            // recycle when runner has clearly passed this tile
+            if (runner.position.z - first.position.z > tileLength * 1.5f)
+            {
+                if (respawnVariantOnRecycle)
+                {
+                    // Destroy old tile, spawn a fresh prefab for the next position (so variant rotation advances)
+                    var old = _tiles.Dequeue();
+                    if (old) Destroy(old.gameObject);
+
+                    SpawnTile(safe: false); // safe tiles only mattered at startup
+                    var last = _tiles.Peek(); // SpawnTile enqueued the new one at the back; but we want queue order preserved
+                    // Note: SpawnTile enqueues at tail; we don't need to manually move it here.
+                }
+                else
+                {
+                    // Old behavior: move the same GO forward (keeps its original variant forever)
+                    Transform t = _tiles.Dequeue();
+                    t.position = new Vector3(0f, 0f, _spawnZ);
+                    _spawnZ += tileLength;
+
+                    var tile = t.GetComponent<TileController>();
+                    if (tile)
+                    {
+                        bool keepSafe = _tiles.Count < safeTiles;
+                        float obsChance = keepSafe ? 0f : obstacleChancePerRow;
+                        float coinChance = keepSafe ? 0f : coinChancePerRow;
+                        float magChance = keepSafe ? 0f : magnetChancePerTile;
+                        float shieldChance = keepSafe ? 0f : shieldChancePerTile;
+
+                        // ---- HARD MODE DASH DISABLE ----
+                        float dashChance = keepSafe ? 0f : dashChancePerTile;
+                        if (IsHard()) dashChance = 0f;
+
+                        float cloakChance = keepSafe ? 0f : cloakChancePerTile;
+
+                        tile.Populate(_rng,
+                                      obstaclePrefabs, obsChance,
+                                      coinPrefabs, coinChance,
+                                      magnetPrefab, magChance,
+                                      shieldPrefab, shieldChance,
+                                      dashPrefab, dashChance,
+                                      cloakPrefab, cloakChance);
+                    }
+                    _tiles.Enqueue(t);
+                }
+            }
+        }
+
+        // ------- helpers -------
+
+        void SpawnTile(bool safe)
+        {
+            int usedVariantIndex;
+            GameObject prefab = GetNextGroundPrefab(out usedVariantIndex);
+            if (!prefab)
+            {
+                Debug.LogError("[TrackManager] No ground tile prefab(s) assigned.");
+                return;
+            }
+
+            GameObject go = Instantiate(prefab, new Vector3(0f, 0f, _spawnZ), Quaternion.identity, transform);
+            _spawnZ += tileLength;
+            _tiles.Enqueue(go.transform);
+
+            // Rename for clarity during Play Mode
+            if (groundTilePrefabs != null && groundTilePrefabs.Length > 0)
+                go.name = $"{prefab.name}_v{usedVariantIndex}_#{_spawnCount}";
+            else
+                go.name = $"{prefab.name}_#{_spawnCount}";
+            _spawnCount++;
+
+            var tile = go.GetComponent<TileController>();
+            if (tile)
+            {
+                float obsChance = safe ? 0f : obstacleChancePerRow;
+                float coinChance = safe ? 0f : coinChancePerRow;
+                float magChance = safe ? 0f : magnetChancePerTile;
+                float shieldChance = safe ? 0f : shieldChancePerTile;
+
+                // ---- HARD MODE DASH DISABLE ----
+                float dashChance = safe ? 0f : dashChancePerTile;
+                if (IsHard()) dashChance = 0f;
+
+                float cloakChance = safe ? 0f : cloakChancePerTile;
+
+                tile.Populate(_rng,
+                              obstaclePrefabs, obsChance,
+                              coinPrefabs, coinChance,
+                              magnetPrefab, magChance,
+                              shieldPrefab, shieldChance,
+                              dashPrefab, dashChance,
+                              cloakPrefab, cloakChance);
+            }
+        }
+
+        GameObject GetNextGroundPrefab(out int usedVariantIndex)
+        {
+            usedVariantIndex = -1;
+
+            if (groundTilePrefabs != null && groundTilePrefabs.Length > 0)
+            {
+                int batch = Mathf.Max(1, variantBatchCount);
+
+                if (_variantIndex < 0) { _variantIndex = 0; _variantCountInBatch = 0; }
+
+                if (_variantCountInBatch >= batch || groundTilePrefabs[_variantIndex] == null)
+                {
+                    int tries = 0;
+                    do
+                    {
+                        _variantIndex = (_variantIndex + 1) % groundTilePrefabs.Length;
+                        tries++;
+                        if (tries > groundTilePrefabs.Length) break; // all null?
+                    } while (groundTilePrefabs[_variantIndex] == null);
+
+                    _variantCountInBatch = 0;
+                }
+
+                var pick = groundTilePrefabs[_variantIndex];
+                usedVariantIndex = _variantIndex;
+                _variantCountInBatch++;
+
+                if (debugVariantPicks)
+                    Debug.Log($"[TrackManager] Pick v{usedVariantIndex} -> {(pick ? pick.name : "NULL")} | in-batch {_variantCountInBatch}/{batch}");
+
+                return pick ? pick : groundTilePrefab;
+            }
+
+            usedVariantIndex = -1;
+            return groundTilePrefab;
+        }
+
+        // ---- Difficulty helper ----
+        static bool IsHard()
+        {
+            // 0=Easy, 1=Medium, 2=Hard
+            return PlayerPrefs.GetInt("SR_Difficulty", 0) == 2;
+        }
+    }
+}
+
+
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace ShadowRunners.Gameplay
+{
+    /// Spawns obstacles, coins, and power-ups on this tile (world-space instantiation).
+    /// Coins are tagged with the current runId so collections can be counted per run.
+    public class TileController : MonoBehaviour
+    {
+        [Header("Lane Layout")]
+        public float laneOffset = 2f;
+
+        [Header("Obstacle Rows (Z from tile center)")]
+        public float[] obstacleRowZ = new float[] { -4f, 0f, 4f };
+
+        [Header("Pickup Rows (Z from tile center)")]
+        public float[] pickupRowZ = new float[] { -5.5f, -2f, 2f, 5.5f };
+
+        [Header("Placement Y")]
+        public float obstacleSpawnY = 0f;
+        public float pickupSpawnY = 0.6f;
+
+        [Header("Layers")]
+        public string obstacleLayerName = "Obstacle";
+
+        [Header("Avoidance")]
+        public float coinAvoidMarginZ = 0.6f;
+
+        int _obstacleLayer = -1;
+        readonly List<GameObject> _spawned = new();
+
+        const float TileLength = 36f;
+        float _zStartWorld, _zEndWorld;
+
+        void Awake()
+        {
+            _obstacleLayer = LayerMask.NameToLayer(obstacleLayerName);
+            if (_obstacleLayer < 0)
+                Debug.LogWarning($"[TileController] Layer '{obstacleLayerName}' not found.");
+
+            _zStartWorld = transform.position.z - TileLength * 0.5f;
+            _zEndWorld = transform.position.z + TileLength * 0.5f;
+        }
+
+        public void Clear()
+        {
+            for (int i = 0; i < _spawned.Count; i++)
+                if (_spawned[i]) Destroy(_spawned[i]);
+            _spawned.Clear();
+        }
+
+        public void Populate(System.Random rng,
+                             GameObject[] obstaclePrefabs, float obstacleChancePerRow,
+                             GameObject[] coinPrefabs, float coinChancePerRow,
+                             GameObject magnetPrefab, float magnetChancePerTile,
+                             GameObject shieldPrefab, float shieldChancePerTile,
+                             GameObject dashPrefab, float dashChancePerTile,
+                             GameObject cloakPrefab, float cloakChancePerTile)
+        {
+            Clear();
+
+            var blocked = new Dictionary<int, List<Vector2>> {
+                { -1, new List<Vector2>() }, { 0, new List<Vector2>() }, { +1, new List<Vector2>() }
+            };
+
+            // Obstacles
+            if (obstaclePrefabs != null && obstaclePrefabs.Length > 0)
+            {
+                foreach (float zLocal in obstacleRowZ)
+                {
+                    if (rng.NextDouble() <= obstacleChancePerRow)
+                    {
+                        int lane = rng.Next(-1, 2);
+                        float worldZ = transform.position.z + zLocal;
+                        float worldX = transform.position.x + lane * laneOffset;
+                        float worldY = transform.position.y + obstacleSpawnY;
+
+                        var prefab = obstaclePrefabs[rng.Next(0, obstaclePrefabs.Length)];
+                        Quaternion rot = prefab.transform.rotation;
+                        var inst = Instantiate(prefab, new Vector3(worldX, worldY, worldZ), rot);
+                        inst.transform.SetParent(transform, true);
+                        if (_obstacleLayer >= 0) SetLayerRecursive(inst, _obstacleLayer);
+                        _spawned.Add(inst);
+
+                        var b = GetWorldBounds(inst);
+                        float zMin = b.min.z - coinAvoidMarginZ;
+                        float zMax = b.max.z + coinAvoidMarginZ;
+                        if (zMax < zMin) { var t = zMin; zMin = zMax; zMax = t; }
+                        blocked[lane].Add(new Vector2(zMin, zMax));
+                    }
+                }
+            }
+
+            // Power-ups (avoid overlapping obstacle bounds)
+            TrySpawnPickupWorld(rng, magnetPrefab, magnetChancePerTile, blocked);
+            TrySpawnPickupWorld(rng, shieldPrefab, shieldChancePerTile, blocked);
+            TrySpawnPickupWorld(rng, dashPrefab, dashChancePerTile, blocked);
+            TrySpawnPickupWorld(rng, cloakPrefab, cloakChancePerTile, blocked);
+
+            // Coins via CoinRunDirector (tag with runId)
+            if (coinPrefabs != null && coinPrefabs.Length > 0)
+            {
+                var director = CoinRunDirector.Instance;
+                if (!director)
+                {
+                    var go = new GameObject("[CoinRunDirector]");
+                    director = go.AddComponent<CoinRunDirector>();
+                    director.laneOffset = laneOffset;
+                    director.ResetAll(_zStartWorld);
+                }
+
+                director.laneOffset = laneOffset;
+                director.PlanForTile(_zStartWorld, _zEndWorld,
+                                     out bool hasRun, out int lane, out float firstZ, out int count, out int runId);
+
+                if (hasRun && count > 0)
+                {
+                    float step = director.coinSpacing;
+                    for (int i = 0; i < count; i++)
+                    {
+                        float worldZ = firstZ + i * step;
+                        if (IsBlocked(blocked, lane, worldZ)) continue;
+                        if (Random.value > coinChancePerRow) continue;
+
+                        float worldX = transform.position.x + lane * laneOffset;
+                        float worldY = transform.position.y + pickupSpawnY;
+
+                        var prefab = coinPrefabs[rng.Next(0, coinPrefabs.Length)];
+                        Quaternion rot = prefab.transform.rotation;
+                        var inst = Instantiate(prefab, new Vector3(worldX, worldY, worldZ), rot);
+                        inst.transform.SetParent(transform, true);
+                        _spawned.Add(inst);
+
+                        // Tag coin with the current run id so collection can be tracked
+                        var tag = inst.GetComponent<CoinRunIdTag>();
+                        if (!tag) tag = inst.AddComponent<CoinRunIdTag>();
+                        tag.runId = runId;
+                    }
+                }
+            }
+        }
+
+        // helpers
+
+        static bool IsBlocked(Dictionary<int, List<Vector2>> blocked, int lane, float worldZ)
+        {
+            if (!blocked.TryGetValue(lane, out var list) || list == null) return false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var seg = list[i];
+                if (worldZ >= seg.x && worldZ <= seg.y) return true;
+            }
+            return false;
+        }
+
+        void TrySpawnPickupWorld(System.Random rng, GameObject prefab, float chancePerTile,
+                                 Dictionary<int, List<Vector2>> blocked)
+        {
+            if (!prefab || chancePerTile <= 0f) return;
+            if (rng.NextDouble() > chancePerTile) return;
+
+            int lane = rng.Next(-1, 2);
+            float zLocal = (pickupRowZ.Length > 0) ? pickupRowZ[rng.Next(0, pickupRowZ.Length)] : 0f;
+            float worldZ = transform.position.z + zLocal;
+            if (IsBlocked(blocked, lane, worldZ)) return;
+
+            float worldX = transform.position.x + lane * laneOffset;
+            float worldY = transform.position.y + pickupSpawnY;
+
+            Quaternion rot = prefab.transform.rotation;
+            var inst = Instantiate(prefab, new Vector3(worldX, worldY, worldZ), rot);
+            inst.transform.SetParent(transform, true);
+            _spawned.Add(inst);
+        }
+
+        static Bounds GetWorldBounds(GameObject go)
+        {
+            var cols = go.GetComponentsInChildren<Collider>(true);
+            if (cols != null && cols.Length > 0)
+            {
+                Bounds b = cols[0].bounds;
+                for (int i = 1; i < cols.Length; i++) b.Encapsulate(cols[i].bounds);
+                return b;
+            }
+            var rends = go.GetComponentsInChildren<Renderer>(true);
+            if (rends != null && rends.Length > 0)
+            {
+                Bounds b = rends[0].bounds;
+                for (int i = 1; i < rends.Length; i++) b.Encapsulate(rends[i].bounds);
+                return b;
+            }
+            var t = go.transform;
+            return new Bounds(t.position, Vector3.one * 0.1f);
+        }
+
+        static void SetLayerRecursive(GameObject go, int layer)
+        {
+            go.layer = layer;
+            foreach (Transform t in go.transform)
+                SetLayerRecursive(t.gameObject, layer);
+        }
+    }
+}
+
+
+// Assets/_Project/Scripts/UI/DifficultyDropdown.cs
+using UnityEngine;
+using UnityEngine.Events;
+using UnityEngine.UI;    // Legacy UGUI Dropdown
+using TMPro;            // TMP_Dropdown
+using ShadowRunners.Gameplay; // RunnerMotor
+using ShadowRunners.Systems;  // ScoreSystem
+
+namespace ShadowRunners.UI
+{
+    /// <summary>
+    /// Options: 0=Easy, 1=Medium, 2=Hard.
+    /// Applies speeds to RunnerMotor (even if disabled at title) and sets ScoreSystem coin value 1/2/3.
+    /// </summary>
+    public class DifficultyDropdown : MonoBehaviour
+    {
+        [Header("UI (assign one)")]
+        public TMP_Dropdown tmpDropdown;
+        public Dropdown uguiDropdown;
+
+        [Header("Behavior")]
+        public bool applyImmediately = true;
+        public bool savePlayerPrefsOnChange = true;
+
+        [Header("Events")]
+        public UnityEvent<int> onDifficultyChanged; // passes 0,1,2
+
+        // Baseline EASY numbers
+        const float BaseForward = 8f;
+        const float BaseMax = 18f;
+        const float BaseAccel = 0.6f;
+
+        const string PP_DIFFICULTY = "SR_Difficulty"; // 0/1/2
+        const string PP_COINVALUE = "SR_CoinValue";  // 1/2/3
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+        static void RuntimeApplySaved()
+        {
+            int idx = Mathf.Clamp(PlayerPrefs.GetInt(PP_DIFFICULTY, 0), 0, 2);
+            ApplyNowToAllRunnerMotors(idx, includeInactive: true);
+            int coinV = DifficultyToCoinValue(idx);
+            PlayerPrefs.SetInt(PP_COINVALUE, coinV);
+            var ss = ScoreSystem.Instance;
+            if (ss) ss.SetDifficultyCoinValue(coinV);
+        }
+
+        void Reset()
+        {
+            if (!tmpDropdown) tmpDropdown = GetComponent<TMP_Dropdown>();
+            if (!uguiDropdown) uguiDropdown = GetComponent<Dropdown>();
+        }
+
+        void Awake()
+        {
+            if (!tmpDropdown && !uguiDropdown)
+            {
+                tmpDropdown = GetComponent<TMP_Dropdown>();
+                uguiDropdown = GetComponent<Dropdown>();
+            }
+
+            if (tmpDropdown) tmpDropdown.onValueChanged.AddListener(HandleChanged);
+            if (uguiDropdown) uguiDropdown.onValueChanged.AddListener(HandleChanged);
+        }
+
+        void OnEnable()
+        {
+            int idx = Mathf.Clamp(PlayerPrefs.GetInt(PP_DIFFICULTY, 0), 0, 2);
+            if (tmpDropdown) tmpDropdown.SetValueWithoutNotify(idx);
+            if (uguiDropdown) uguiDropdown.SetValueWithoutNotify(idx);
+
+            if (applyImmediately)
+            {
+                ApplyNowToAllRunnerMotors(idx, includeInactive: true);
+
+                int coinV = DifficultyToCoinValue(idx);
+                PlayerPrefs.SetInt(PP_COINVALUE, coinV);
+                if (savePlayerPrefsOnChange) PlayerPrefs.Save();
+
+                var ss = ScoreSystem.Instance;
+                if (ss) ss.SetDifficultyCoinValue(coinV);
+            }
+        }
+
+        void OnDestroy()
+        {
+            if (tmpDropdown) tmpDropdown.onValueChanged.RemoveListener(HandleChanged);
+            if (uguiDropdown) uguiDropdown.onValueChanged.RemoveListener(HandleChanged);
+        }
+
+        void HandleChanged(int idx)
+        {
+            idx = Mathf.Clamp(idx, 0, 2);
+            PlayerPrefs.SetInt(PP_DIFFICULTY, idx);
+
+            int coinV = DifficultyToCoinValue(idx);
+            PlayerPrefs.SetInt(PP_COINVALUE, coinV);
+            if (savePlayerPrefsOnChange) PlayerPrefs.Save();
+
+            if (applyImmediately)
+            {
+                ApplyNowToAllRunnerMotors(idx, includeInactive: true);
+                var ss = ScoreSystem.Instance;
+                if (ss) ss.SetDifficultyCoinValue(coinV);
+            }
+
+            onDifficultyChanged?.Invoke(idx);
+        }
+
+        static int DifficultyToCoinValue(int idx) => (idx == 0) ? 1 : (idx == 1) ? 2 : 3;
+
+        static void ApplyNowToAllRunnerMotors(int difficultyIdx, bool includeInactive = true)
+        {
+            float mult = (difficultyIdx == 0) ? 1f : (difficultyIdx == 1) ? 2f : 3f;
+
+            var motors = Object.FindObjectsOfType<RunnerMotor>(includeInactive: includeInactive);
+            for (int i = 0; i < motors.Length; i++)
+            {
+                var m = motors[i];
+                if (!m) continue;
+
+                m.maxSpeed = BaseMax * mult;
+
+                float desiredForward = BaseForward * mult;
+                m.forwardSpeed = Mathf.Clamp(Mathf.Max(m.forwardSpeed, desiredForward), 0f, m.maxSpeed);
+
+                m.acceleration = BaseAccel * mult;
+            }
+        }
+    }
+}
+
+
+
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using TMPro;
+using ShadowRunners.Systems; // GlobalRunHold
+
+namespace ShadowRunners.UI
+{
+    /// 3-2-1 overlay that truly freezes the runner during countdown.
+    [AddComponentMenu("ShadowRunners/UI/Resume Countdown Overlay")]
+    public class ResumeCountdownOverlay : MonoBehaviour
+    {
+        [Header("Refs")]
+        public MonoBehaviour pauseMenuController; // expects TogglePause()
+        public GameObject overlayRoot;
+        public TextMeshProUGUI label;
+
+        [Header("Timing (unscaled)")]
+        public float stepSeconds = 0.6f;
+        public float goSeconds = 0.5f;
+
+        [Header("Scale Pop")]
+        public float popScale = 1.35f;
+
+        [Header("Behavior")]
+        public bool callTogglePauseAtEnd = true;
+
+        [Header("Optional SFX")]
+        public AudioSource audioSource;
+        public AudioClip tickSfx;
+        public AudioClip goSfx;
+
+        Coroutine _co;
+        float _prevTimeScale = 1f;
+        readonly List<ShadowRunners.Gameplay.RunnerMotor> _temporarilyDisabled = new();
+
+        void Awake()
+        {
+            if (overlayRoot) overlayRoot.SetActive(false);
+        }
+
+        public void BeginResume()
+        {
+            if (!isActiveAndEnabled) return;
+            if (_co != null) StopCoroutine(_co);
+            _co = StartCoroutine(CoCountdown());
+        }
+
+        IEnumerator CoCountdown()
+        {
+            if (!overlayRoot || !label) yield break;
+
+            // HARD HOLD (global) so RunnerMotor.Update early-outs
+            GlobalRunHold.Held = true;
+
+            // Extra belt: disable any currently-enabled RunnerMotors
+            _temporarilyDisabled.Clear();
+            var motors = FindObjectsOfType<ShadowRunners.Gameplay.RunnerMotor>(includeInactive: true);
+            for (int i = 0; i < motors.Length; i++)
+            {
+                var m = motors[i];
+                if (m && m.enabled) { m.enabled = false; _temporarilyDisabled.Add(m); }
+            }
+
+            // Freeze scaled time so anything using Time.deltaTime stops
+            _prevTimeScale = Time.timeScale;
+            Time.timeScale = 0f;
+
+            // Show overlay & run unscaled countdown
+            overlayRoot.SetActive(true);
+            yield return Step("3");
+            yield return Step("2");
+            yield return Step("1");
+
+            if (tickSfx && audioSource) audioSource.Stop();
+            if (goSfx && audioSource) audioSource.PlayOneShot(goSfx);
+            label.text = "GO";
+            yield return ScalePop(goSeconds);
+
+            overlayRoot.SetActive(false);
+
+            // Unfreeze scaled time first
+            Time.timeScale = (_prevTimeScale <= 0f) ? 1f : _prevTimeScale;
+
+            // Optionally toggle your pause menu to actually resume systems/UI states
+            if (callTogglePauseAtEnd && pauseMenuController)
+            {
+                var m = pauseMenuController.GetType().GetMethod("TogglePause");
+                if (m != null) m.Invoke(pauseMenuController, null);
+            }
+
+            // Re-enable motors we turned off
+            for (int i = 0; i < _temporarilyDisabled.Count; i++)
+                if (_temporarilyDisabled[i]) _temporarilyDisabled[i].enabled = true;
+            _temporarilyDisabled.Clear();
+
+            // Release the global hold LAST (so first Update after resume can run normally)
+            GlobalRunHold.Held = false;
+
+            _co = null;
+        }
+
+        IEnumerator Step(string txt)
+        {
+            label.text = txt;
+            if (tickSfx && audioSource) audioSource.PlayOneShot(tickSfx);
+
+            float t = 0f, T = Mathf.Max(0.05f, stepSeconds);
+            while (t < T)
+            {
+                t += Time.unscaledDeltaTime;
+                float u = Mathf.Clamp01(t / T);
+                float s = Mathf.Lerp(popScale, 1f, EaseOutCubic(u));
+                label.rectTransform.localScale = Vector3.one * s;
+                yield return null;
+            }
+        }
+
+        IEnumerator ScalePop(float T)
+        {
+            float t = 0f; T = Mathf.Max(0.05f, T);
+            while (t < T)
+            {
+                t += Time.unscaledDeltaTime;
+                float u = Mathf.Clamp01(t / T);
+                float s = Mathf.Lerp(popScale, 1f, EaseOutCubic(u));
+                label.rectTransform.localScale = Vector3.one * s;
+                yield return null;
+            }
+        }
+
+        static float EaseOutCubic(float x) => 1f - Mathf.Pow(1f - x, 3f);
+    }
+}
+
+
+using UnityEngine;
+using ShadowRunners.Gameplay;   // RunnerMotor, GameManager
+using ShadowRunners.Systems;    // ScoreSystem
+
+namespace ShadowRunners.UI
+{
+    /// Re-applies saved difficulty whenever a run begins (and on enable).
+    /// Works even if RunnerMotor is disabled at title, or if the options UI isn't opened.
+    [AddComponentMenu("ShadowRunners/UI/Difficulty Runtime Applier")]
+    public class DifficultyRuntimeApplier : MonoBehaviour
+    {
+        // Baseline EASY numbers (must match your design)
+        const float BaseForward = 8f;
+        const float BaseMax = 18f;
+        const float BaseAccel = 0.6f;
+
+        const string PP_DIFFICULTY = "SR_Difficulty"; // 0=Easy, 1=Medium, 2=Hard
+        const string PP_COINVALUE = "SR_CoinValue";  // 1/2/3
+
+        GameManager.GameState _lastState = (GameManager.GameState)(-999);
+
+        void OnEnable()
+        {
+            // Apply immediately in case we're enabling mid-run
+            ApplySavedDifficultyToScene();
+        }
+
+        void Update()
+        {
+            var gm = GameManager.Instance;
+            var state = gm ? gm.State : GameManager.GameState.Running;
+
+            if (state != _lastState)
+            {
+                // The moment we enter Running, re-apply the saved difficulty
+                if (state == GameManager.GameState.Running)
+                    ApplySavedDifficultyToScene();
+
+                _lastState = state;
+            }
+        }
+
+        static void ApplySavedDifficultyToScene()
+        {
+            int idx = Mathf.Clamp(PlayerPrefs.GetInt(PP_DIFFICULTY, 0), 0, 2);
+            float mult = (idx == 0) ? 1f : (idx == 1) ? 2f : 3f;
+
+            // Apply to ALL RunnerMotors, even if some are disabled at title
+            var motors = Object.FindObjectsOfType<RunnerMotor>(includeInactive: true);
+            for (int i = 0; i < motors.Length; i++)
+            {
+                var m = motors[i];
+                if (!m) continue;
+
+                m.maxSpeed = BaseMax * mult;
+
+                float desiredForward = BaseForward * mult;
+                m.forwardSpeed = Mathf.Clamp(Mathf.Max(m.forwardSpeed, desiredForward), 0f, m.maxSpeed);
+
+                m.acceleration = BaseAccel * mult;
+            }
+
+            // Keep coin value (1/2/3) in sync and push it into ScoreSystem
+            int coinV = (idx == 0) ? 1 : (idx == 1) ? 2 : 3;
+            PlayerPrefs.SetInt(PP_COINVALUE, coinV);
+            PlayerPrefs.Save();
+
+            if (ScoreSystem.Instance)
+                ScoreSystem.Instance.SetDifficultyCoinValue(coinV);
+        }
+    }
+}
+
+
+
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using TMPro;
+
+namespace ShadowRunners.UI
+{
+    /// Shows a centered "+X" popup for ~1s. Call Show(int) to display.
+    [AddComponentMenu("ShadowRunners/UI/Coin Run Popup System")]
+    public class CoinRunPopupSystem : MonoBehaviour
+    {
+        public static CoinRunPopupSystem Instance { get; private set; }
+
+        [Header("Visual")]
+        public TMP_FontAsset font;   // optional; falls back to TMP default
+        public int fontSize = 64;
+        public string prefix = "+";
+        public float showSeconds = 1.0f;
+        public float riseDistance = 40f;
+        public int poolSize = 3;
+
+        [Header("Color")]
+        public Color startColor = new Color(1f, 0.65f, 0.15f, 1f);
+        public Color endColor = new Color(1f, 0.65f, 0.15f, 0f);
+
+        readonly Queue<TMP_Text> _pool = new Queue<TMP_Text>();
+        readonly List<TMP_Text> _live = new List<TMP_Text>(8);
+
+        void Awake()
+        {
+            if (Instance && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+        }
+
+        public void Show(int coins)
+        {
+            var t = Get();
+            t.text = $"{prefix}{coins}";
+            t.color = startColor;
+            t.fontSize = fontSize;
+
+            var rt = t.rectTransform;
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+            rt.anchoredPosition = Vector2.zero;
+            rt.localScale = Vector3.one;
+
+            StartCoroutine(CoRun(t));
+        }
+
+        IEnumerator CoRun(TMP_Text t)
+        {
+            _live.Add(t);
+            float t0 = Time.unscaledTime;
+            float T = Mathf.Max(0.05f, showSeconds);
+
+            var startPos = t.rectTransform.anchoredPosition;
+            var endPos = startPos + new Vector2(0f, riseDistance);
+
+            while (Time.unscaledTime - t0 < T)
+            {
+                float u = Mathf.InverseLerp(0f, T, Time.unscaledTime - t0);
+                float e = u * u * (3f - 2f * u);
+
+                t.rectTransform.anchoredPosition = Vector2.LerpUnclamped(startPos, endPos, e);
+                t.color = Color.LerpUnclamped(startColor, endColor, u);
+
+                yield return null;
+            }
+
+            Return(t);
+        }
+
+        TMP_Text Get()
+        {
+            if (_pool.Count > 0)
+            {
+                var t = _pool.Dequeue();
+                t.gameObject.SetActive(true);
+                return t;
+            }
+
+            var go = new GameObject("CoinRunPopup", typeof(RectTransform));
+            go.transform.SetParent(transform, false);
+            var text = go.AddComponent<TextMeshProUGUI>();
+            text.alignment = TextAlignmentOptions.Center;
+            text.raycastTarget = false;
+            text.enableAutoSizing = false;
+            text.font = font ? font : TMP_Settings.defaultFontAsset;
+            text.fontSize = fontSize;
+            text.text = "+0";
+            return text;
+        }
+
+        void Return(TMP_Text t)
+        {
+            _live.Remove(t);
+            if (_pool.Count >= poolSize) { Destroy(t.gameObject); return; }
+            t.gameObject.SetActive(false);
+            _pool.Enqueue(t);
+        }
+    }
+}
+
+
+using UnityEngine;
+using System;
+using System.Collections.Generic;
+
+namespace ShadowRunners.Gameplay
+{
+    /// Manages single-lane coin "runs" (10..15 coins), spaced and gapped.
+    /// Tiles ask for a plan per tile. Emits OnRunStarted(runId,total) and remembers planned totals.
+    public class CoinRunDirector : MonoBehaviour
+    {
+        public static CoinRunDirector Instance { get; private set; }
+
+        [Header("Run Settings")]
+        public Vector2Int runLengthRange = new Vector2Int(10, 15);
+        public float coinSpacing = 1.5f;         // meters
+        public float gapAfterRun = 3.5f;         // meters
+        [Range(0f, 1f)] public float startChancePerTile = 0.65f;
+
+        [Header("Lanes")]
+        public float laneOffset = 2f;
+
+        // Runtime state
+        System.Random _rng;
+        bool _active;
+        int _lane;               // -1,0,+1
+        int _coinsRemaining;
+        int _runTotalCoins;
+        float _zCursor;            // next coin world Z
+        float _cooldownZ;          // earliest world Z we may start a new run
+        int _runIdCounter;       // unique id per run
+        int _currentRunId = -1;
+
+        // Keeps planned totals even if tracker subscribes late.
+        readonly Dictionary<int, int> _plannedByRun = new Dictionary<int, int>();
+
+        /// Fired when a new run is created (before any coins spawn).
+        /// Args: runId, totalCoinsPlanned.
+        public event Action<int, int> OnRunStarted;
+
+        void Awake()
+        {
+            if (Instance && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+            _rng = new System.Random();
+        }
+
+        /// Call at scene/track start.
+        public void ResetAll(float worldZStart)
+        {
+            _active = false;
+            _coinsRemaining = 0;
+            _runTotalCoins = 0;
+            _zCursor = worldZStart;
+            _cooldownZ = worldZStart;
+            _currentRunId = -1;
+            _plannedByRun.Clear();
+        }
+
+        /// Tiles call this to get the portion of the current run to place on THIS tile.
+        /// Outputs: hasRun, lane, firstCoinZ (world), count (coins on this tile), runId.
+        public void PlanForTile(float tileZStart, float tileZEnd,
+                                out bool hasRun, out int lane,
+                                out float firstCoinZ, out int count, out int runId)
+        {
+            hasRun = false; lane = 0; firstCoinZ = 0f; count = 0; runId = -1;
+
+            // Continue current run
+            if (_active)
+            {
+                hasRun = true;
+                lane = _lane;
+                runId = _currentRunId;
+
+                firstCoinZ = Mathf.Max(_zCursor, tileZStart);
+                int canFit = Mathf.Max(0, 1 + Mathf.FloorToInt((tileZEnd - firstCoinZ) / coinSpacing));
+                count = Mathf.Min(_coinsRemaining, canFit);
+
+                _zCursor = firstCoinZ + count * coinSpacing;
+                _coinsRemaining -= count;
+
+                if (_coinsRemaining <= 0)
+                {
+                    _active = false;
+                    _cooldownZ = _zCursor + gapAfterRun;
+                    _currentRunId = -1;
+                }
+                return;
+            }
+
+            // Maybe start a new run on/within this tile
+            if (tileZStart >= _cooldownZ && _rng.NextDouble() <= startChancePerTile)
+            {
+                _active = true;
+                _lane = _rng.Next(-1, 2); // -1,0,+1
+                _coinsRemaining = UnityEngine.Random.Range(runLengthRange.x, runLengthRange.y + 1);
+                _runTotalCoins = _coinsRemaining;
+                _currentRunId = ++_runIdCounter;
+
+                // Remember planned total; announce to listeners
+                _plannedByRun[_currentRunId] = _runTotalCoins;
+                OnRunStarted?.Invoke(_currentRunId, _runTotalCoins);
+
+                float startZ = Mathf.Max(tileZStart, _cooldownZ);
+                _zCursor = startZ;
+
+                hasRun = true;
+                lane = _lane;
+                runId = _currentRunId;
+
+                firstCoinZ = Mathf.Max(_zCursor, tileZStart);
+                int canFit = Mathf.Max(0, 1 + Mathf.FloorToInt((tileZEnd - firstCoinZ) / coinSpacing));
+                count = Mathf.Min(_coinsRemaining, canFit);
+
+                _zCursor = firstCoinZ + count * coinSpacing;
+                _coinsRemaining -= count;
+
+                if (_coinsRemaining <= 0)
+                {
+                    _active = false;
+                    _cooldownZ = _zCursor + gapAfterRun;
+                    _currentRunId = -1;
+                }
+            }
+        }
+
+        /// Tracker can call this if it missed OnRunStarted.
+        public bool TryGetPlannedCount(int runId, out int total)
+        {
+            return _plannedByRun.TryGetValue(runId, out total);
+        }
+
+        /// Optional: expose current active run for late binders.
+        public bool TryGetActiveRun(out int runId, out int totalPlanned, out int remaining)
+        {
+            if (_currentRunId < 0 || !_active) { runId = -1; totalPlanned = 0; remaining = 0; return false; }
+            runId = _currentRunId;
+            _plannedByRun.TryGetValue(_currentRunId, out totalPlanned);
+            remaining = _coinsRemaining;
+            return true;
+        }
+    }
+}
+
+
+
+
+using System.Collections.Generic;
+using UnityEngine;
+using ShadowRunners.UI;
+using ShadowRunners.Systems;
+
+namespace ShadowRunners.Gameplay
+{
+    /// Tracks collected coins per runId; accurately sums the actual amounts
+    /// added by ScoreSystem for coins belonging to that run, using a pairing queue.
+    [AddComponentMenu("ShadowRunners/Gameplay/Coin Run Collection Tracker")]
+    public class CoinRunCollectionTracker : MonoBehaviour
+    {
+        // runId -> (planned count, collected count, summed value)
+        private readonly Dictionary<int, (int planned, int collected, int valueSum)> _runs = new();
+
+        private CoinRunDirector _dir;
+
+        // Pairing FIFOs
+        private readonly Queue<(int runId, float t)> _pendingRunIds = new();
+        private readonly Queue<(int amount, float t)> _pendingAmounts = new();
+
+        // If events come out of order, we allow this many seconds to pair them
+        [Tooltip("Max time window to pair a runId with a coin amount.")]
+        public float pairWindowSeconds = 0.25f;
+
+        void OnEnable()
+        {
+            TryBindDirector();
+            CoinRunCollectionEvents.OnCoinCollectedForRun += OnCoinCollectedForRun;
+            ScoreSystem.OnCoinsAdded += OnCoinsAdded;
+        }
+
+        void OnDisable()
+        {
+            UnbindDirector();
+            CoinRunCollectionEvents.OnCoinCollectedForRun -= OnCoinCollectedForRun;
+            ScoreSystem.OnCoinsAdded -= OnCoinsAdded;
+        }
+
+        void Update()
+        {
+            if (_dir == null) TryBindDirector();
+            PairQueues();
+            CullStale();
+        }
+
+        void TryBindDirector()
+        {
+            var d = CoinRunDirector.Instance;
+            if (!d || d == _dir) return;
+
+            UnbindDirector();
+            _dir = d;
+            _dir.OnRunStarted += HandleRunStarted;
+
+            // Seed active run if we attached mid-stream
+            if (_dir.TryGetActiveRun(out int runId, out int total, out int remaining))
+            {
+                if (runId >= 0 && total > 0 && !_runs.ContainsKey(runId))
+                    _runs[runId] = (planned: total, collected: 0, valueSum: 0);
+            }
+        }
+
+        void UnbindDirector()
+        {
+            if (_dir != null)
+            {
+                _dir.OnRunStarted -= HandleRunStarted;
+                _dir = null;
+            }
+        }
+
+        void HandleRunStarted(int runId, int totalCoins)
+        {
+            _runs[runId] = (planned: Mathf.Max(0, totalCoins), collected: 0, valueSum: 0);
+        }
+
+        // Event from CoinRunIdTag (per coin)
+        void OnCoinCollectedForRun(int runId)
+        {
+            _pendingRunIds.Enqueue((runId, Time.unscaledTime));
+            PairQueues();
+        }
+
+        // Event from ScoreSystem (per coin, final amount after multipliers)
+        void OnCoinsAdded(int amount)
+        {
+            if (amount <= 0) return;
+            _pendingAmounts.Enqueue((amount, Time.unscaledTime));
+            PairQueues();
+        }
+
+        void PairQueues()
+        {
+            // Pair FIFO within the allowed window
+            while (_pendingRunIds.Count > 0 && _pendingAmounts.Count > 0)
+            {
+                var (rid, tr) = _pendingRunIds.Peek();
+                var (amt, ta) = _pendingAmounts.Peek();
+
+                if (Mathf.Abs(ta - tr) > pairWindowSeconds)
+                {
+                    // If the earliest pair is too far apart, drop the older one
+                    if (tr < ta) { _pendingRunIds.Dequeue(); }
+                    else { _pendingAmounts.Dequeue(); }
+                    continue;
+                }
+
+                // Pair them
+                _pendingRunIds.Dequeue();
+                _pendingAmounts.Dequeue();
+
+                if (!_runs.TryGetValue(rid, out var entry))
+                {
+                    // Missed run start, recover planned total
+                    int planned = 1;
+                    if (_dir != null && _dir.TryGetPlannedCount(rid, out var plannedFromDir))
+                        planned = plannedFromDir;
+                    entry = (planned: Mathf.Max(1, planned), collected: 0, valueSum: 0);
+                }
+
+                entry.collected = Mathf.Min(entry.planned, entry.collected + 1);
+                entry.valueSum += amt;
+                _runs[rid] = entry;
+
+                if (entry.collected >= entry.planned && entry.planned > 0)
+                {
+                    int payout = Mathf.Max(0, entry.valueSum);
+                    _runs.Remove(rid);
+
+                    if (CoinRunPopupSystem.Instance)
+                        CoinRunPopupSystem.Instance.Show(payout);
+                }
+            }
+        }
+
+        void CullStale()
+        {
+            // Keep queues tidy: drop entries that exceeded the pairing window
+            float now = Time.unscaledTime;
+            while (_pendingRunIds.Count > 0 && now - _pendingRunIds.Peek().t > pairWindowSeconds)
+                _pendingRunIds.Dequeue();
+            while (_pendingAmounts.Count > 0 && now - _pendingAmounts.Peek().t > pairWindowSeconds)
+                _pendingAmounts.Dequeue();
+        }
+    }
+}
+
+
+
+using System.Collections.Generic;
+using UnityEngine;
+using ShadowRunners.UI;
+using ShadowRunners.Systems;
+
+namespace ShadowRunners.Gameplay
+{
+    /// Tracks collected coins per runId; accurately sums the actual amounts
+    /// added by ScoreSystem for coins belonging to that run, using a pairing queue.
+    [AddComponentMenu("ShadowRunners/Gameplay/Coin Run Collection Tracker")]
+    public class CoinRunCollectionTracker : MonoBehaviour
+    {
+        // runId -> (planned count, collected count, summed value)
+        private readonly Dictionary<int, (int planned, int collected, int valueSum)> _runs = new();
+
+        private CoinRunDirector _dir;
+
+        // Pairing FIFOs
+        private readonly Queue<(int runId, float t)> _pendingRunIds = new();
+        private readonly Queue<(int amount, float t)> _pendingAmounts = new();
+
+        // If events come out of order, we allow this many seconds to pair them
+        [Tooltip("Max time window to pair a runId with a coin amount.")]
+        public float pairWindowSeconds = 0.25f;
+
+        void OnEnable()
+        {
+            TryBindDirector();
+            CoinRunCollectionEvents.OnCoinCollectedForRun += OnCoinCollectedForRun;
+            ScoreSystem.OnCoinsAdded += OnCoinsAdded;
+        }
+
+        void OnDisable()
+        {
+            UnbindDirector();
+            CoinRunCollectionEvents.OnCoinCollectedForRun -= OnCoinCollectedForRun;
+            ScoreSystem.OnCoinsAdded -= OnCoinsAdded;
+        }
+
+        void Update()
+        {
+            if (_dir == null) TryBindDirector();
+            PairQueues();
+            CullStale();
+        }
+
+        void TryBindDirector()
+        {
+            var d = CoinRunDirector.Instance;
+            if (!d || d == _dir) return;
+
+            UnbindDirector();
+            _dir = d;
+            _dir.OnRunStarted += HandleRunStarted;
+
+            // Seed active run if we attached mid-stream
+            if (_dir.TryGetActiveRun(out int runId, out int total, out int remaining))
+            {
+                if (runId >= 0 && total > 0 && !_runs.ContainsKey(runId))
+                    _runs[runId] = (planned: total, collected: 0, valueSum: 0);
+            }
+        }
+
+        void UnbindDirector()
+        {
+            if (_dir != null)
+            {
+                _dir.OnRunStarted -= HandleRunStarted;
+                _dir = null;
+            }
+        }
+
+        void HandleRunStarted(int runId, int totalCoins)
+        {
+            _runs[runId] = (planned: Mathf.Max(0, totalCoins), collected: 0, valueSum: 0);
+        }
+
+        // Event from CoinRunIdTag (per coin)
+        void OnCoinCollectedForRun(int runId)
+        {
+            _pendingRunIds.Enqueue((runId, Time.unscaledTime));
+            PairQueues();
+        }
+
+        // Event from ScoreSystem (per coin, final amount after multipliers)
+        void OnCoinsAdded(int amount)
+        {
+            if (amount <= 0) return;
+            _pendingAmounts.Enqueue((amount, Time.unscaledTime));
+            PairQueues();
+        }
+
+        void PairQueues()
+        {
+            // Pair FIFO within the allowed window
+            while (_pendingRunIds.Count > 0 && _pendingAmounts.Count > 0)
+            {
+                var (rid, tr) = _pendingRunIds.Peek();
+                var (amt, ta) = _pendingAmounts.Peek();
+
+                if (Mathf.Abs(ta - tr) > pairWindowSeconds)
+                {
+                    // If the earliest pair is too far apart, drop the older one
+                    if (tr < ta) { _pendingRunIds.Dequeue(); }
+                    else { _pendingAmounts.Dequeue(); }
+                    continue;
+                }
+
+                // Pair them
+                _pendingRunIds.Dequeue();
+                _pendingAmounts.Dequeue();
+
+                if (!_runs.TryGetValue(rid, out var entry))
+                {
+                    // Missed run start, recover planned total
+                    int planned = 1;
+                    if (_dir != null && _dir.TryGetPlannedCount(rid, out var plannedFromDir))
+                        planned = plannedFromDir;
+                    entry = (planned: Mathf.Max(1, planned), collected: 0, valueSum: 0);
+                }
+
+                entry.collected = Mathf.Min(entry.planned, entry.collected + 1);
+                entry.valueSum += amt;
+                _runs[rid] = entry;
+
+                if (entry.collected >= entry.planned && entry.planned > 0)
+                {
+                    int payout = Mathf.Max(0, entry.valueSum);
+                    _runs.Remove(rid);
+
+                    if (CoinRunPopupSystem.Instance)
+                        CoinRunPopupSystem.Instance.Show(payout);
+                }
+            }
+        }
+
+        void CullStale()
+        {
+            // Keep queues tidy: drop entries that exceeded the pairing window
+            float now = Time.unscaledTime;
+            while (_pendingRunIds.Count > 0 && now - _pendingRunIds.Peek().t > pairWindowSeconds)
+                _pendingRunIds.Dequeue();
+            while (_pendingAmounts.Count > 0 && now - _pendingAmounts.Peek().t > pairWindowSeconds)
+                _pendingAmounts.Dequeue();
+        }
+    }
+}
+
+
+using System.Collections;
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using ShadowRunners.Systems;
+
+namespace ShadowRunners.UI
+{
+    /// Pulse the top-bar coin UI whenever coins are added.
+    /// - Hooks ScoreSystem.OnCoinsAdded (already added in your ScoreSystem)
+    /// - Pops scale + optional glow/outline on TMP
+    /// - Optionally pops an Image icon too
+    [AddComponentMenu("ShadowRunners/UI/Coin HUD Pulse")]
+    public class CoinHUDPulse : MonoBehaviour
+    {
+        [Header("Targets")]
+        [Tooltip("TMP text that shows the coin total (e.g., TXT_Coins).")]
+        public TextMeshProUGUI coinsText;
+        [Tooltip("Optional UI image icon next to the text.")]
+        public Image coinIcon;
+
+        [Header("Scale Pop")]
+        [Tooltip("Peak scale during the pop.")]
+        public float popScale = 1.18f;
+        [Tooltip("Seconds to reach the peak.")]
+        public float popUpTime = 0.06f;
+        [Tooltip("Seconds to return to normal after the peak.")]
+        public float popDownTime = 0.14f;
+
+        [Header("Glow / Outline (TMP)")]
+        [Tooltip("Enable if your TMP material supports outline/underlay; harmless if not.")]
+        public bool pulseGlow = true;
+        [Tooltip("Max outline width during pulse (TMP Outline).")]
+        [Range(0f, 1f)] public float maxOutlineWidth = 0.18f;
+        [Tooltip("Glow/outline color during pulse.")]
+        public Color glowColor = new Color(1f, 0.85f, 0.2f, 1f);
+
+        Vector3 _baseTextScale = Vector3.one;
+        Vector3 _baseIconScale = Vector3.one;
+        Coroutine _co;
+
+        // TMP material state cache
+        float _baseOutlineWidth;
+        Color _baseOutlineColor;
+        bool _hasOutline;
+
+        void Awake()
+        {
+            if (!coinsText)
+            {
+                // Try to auto-find under this object
+                coinsText = GetComponentInChildren<TextMeshProUGUI>();
+            }
+            if (coinsText)
+            {
+                _baseTextScale = coinsText.rectTransform.localScale;
+
+                // Try to detect outline properties
+                var mat = coinsText.fontMaterial;
+                if (mat && mat.HasProperty(ShaderUtilities.ID_OutlineWidth) && mat.HasProperty(ShaderUtilities.ID_OutlineColor))
+                {
+                    _hasOutline = true;
+                    _baseOutlineWidth = mat.GetFloat(ShaderUtilities.ID_OutlineWidth);
+                    _baseOutlineColor = mat.GetColor(ShaderUtilities.ID_OutlineColor);
+                }
+            }
+            if (coinIcon)
+            {
+                _baseIconScale = coinIcon.rectTransform.localScale;
+            }
+        }
+
+        void OnEnable()
+        {
+            ScoreSystem.OnCoinsAdded += HandleCoinsAdded;
+        }
+
+        void OnDisable()
+        {
+            ScoreSystem.OnCoinsAdded -= HandleCoinsAdded;
+            ResetVisuals();
+        }
+
+        void HandleCoinsAdded(int amount)
+        {
+            if (amount <= 0) return;
+            if (!isActiveAndEnabled) return;
+
+            if (_co != null) StopCoroutine(_co);
+            _co = StartCoroutine(CoPulse());
+        }
+
+        IEnumerator CoPulse()
+        {
+            // Up
+            float t = 0f;
+            while (t < popUpTime)
+            {
+                t += Time.unscaledDeltaTime;
+                float u = Mathf.Clamp01(popUpTime <= 0f ? 1f : t / popUpTime);
+                float e = EaseOutBack(u);
+
+                ApplyScale(Mathf.Lerp(1f, popScale, e));
+                ApplyGlow(Mathf.Lerp(0f, 1f, u));
+                yield return null;
+            }
+
+            // Down
+            t = 0f;
+            while (t < popDownTime)
+            {
+                t += Time.unscaledDeltaTime;
+                float u = Mathf.Clamp01(popDownTime <= 0f ? 1f : t / popDownTime);
+                float e = EaseInCubic(1f - u); // reverse to smooth back
+
+                ApplyScale(Mathf.Lerp(1f, popScale, e));
+                ApplyGlow(Mathf.Lerp(1f, 0f, u));
+                yield return null;
+            }
+
+            ResetVisuals();
+            _co = null;
+        }
+
+        void ApplyScale(float s)
+        {
+            if (coinsText) coinsText.rectTransform.localScale = _baseTextScale * s;
+            if (coinIcon) coinIcon.rectTransform.localScale = _baseIconScale * (0.95f + 0.05f * s); // a bit subtler on icon
+        }
+
+        void ApplyGlow(float k)
+        {
+            if (!pulseGlow || !_hasOutline || !coinsText) return;
+
+            var mat = coinsText.fontMaterial; // this returns an instance for TMPUGUI
+            if (!mat) return;
+
+            float w = Mathf.Lerp(_baseOutlineWidth, maxOutlineWidth, k);
+            Color c = Color.Lerp(_baseOutlineColor, glowColor, k);
+
+            mat.SetFloat(ShaderUtilities.ID_OutlineWidth, w);
+            mat.SetColor(ShaderUtilities.ID_OutlineColor, c);
+
+            // Force refresh
+            coinsText.UpdateMeshPadding();
+            coinsText.SetMaterialDirty();
+        }
+
+        void ResetVisuals()
+        {
+            ApplyScale(1f);
+            if (pulseGlow && _hasOutline && coinsText)
+            {
+                var mat = coinsText.fontMaterial;
+                if (mat)
+                {
+                    mat.SetFloat(ShaderUtilities.ID_OutlineWidth, _baseOutlineWidth);
+                    mat.SetColor(ShaderUtilities.ID_OutlineColor, _baseOutlineColor);
+                    coinsText.UpdateMeshPadding();
+                    coinsText.SetMaterialDirty();
+                }
+            }
+        }
+
+        // Easing helpers
+        static float EaseOutBack(float x)
+        {
+            const float c1 = 1.70158f;
+            const float c3 = c1 + 1f;
+            return 1 + c3 * Mathf.Pow(x - 1, 3) + c1 * Mathf.Pow(x - 1, 2);
+        }
+        static float EaseInCubic(float x) => x * x * x;
+    }
+}
+
+using UnityEngine;
+
+namespace ShadowRunners.Audio
+{
+    /// <summary>
+    /// Plays a one-shot when the coin is collected.
+    /// - Triggers on player enter, OR if the coin is disabled near the player (magnet).
+    /// - Uses AudioOneShotPool instead of spawning/destroying GameObjects.
+    /// </summary>
+    [AddComponentMenu("ShadowRunners/Audio/Coin Pickup SFX")]
+    public class CoinPickupSFX : MonoBehaviour
+    {
+        [Header("Sound")]
+        public AudioClip sfx;
+        [Range(0f, 1f)] public float volume = 0.9f;
+
+        [Header("3D Settings (0 = 2D)")]
+        [Range(0f, 1f)] public float spatialBlend = 0.2f;
+        public float minDistance = 5f;
+        public float maxDistance = 20f;
+
+        [Header("Magnet/Pooling Guard")]
+        [Tooltip("If the coin is disabled within this radius of the player and no SFX has played yet, play it.")]
+        public float playOnDisableNearPlayerRadius = 6f;
+        [Tooltip("Ignore disables that happen immediately on spawn (pooling).")]
+        public float minLifetimeBeforeDisableS = 0.03f;
+
+        bool _played;
+        float _spawnT;
+
+        void OnEnable()
+        {
+            _spawnT = Time.unscaledTime;
+            _played = false;
+        }
+
+        void OnTriggerEnter(Collider other)
+        {
+            if (_played || !sfx) return;
+            if (other && other.CompareTag("Player"))
+                PlayAt(transform.position);
+        }
+
+        void OnDisable()
+        {
+            if (_played || !sfx) return;
+
+            // If we were disabled very quickly, likely pooled despawn � skip.
+            if (Time.unscaledTime - _spawnT < minLifetimeBeforeDisableS) return;
+
+            var player = GameObject.FindGameObjectWithTag("Player");
+            if (!player) return;
+
+            float d = Vector3.Distance(player.transform.position, transform.position);
+            if (d <= playOnDisableNearPlayerRadius)
+                PlayAt(transform.position);
+        }
+
+        /// <summary>Call from other scripts/UnityEvents if you have a collection hook.</summary>
+        public void PlaySFX()
+        {
+            if (!_played && sfx) PlayAt(transform.position);
+        }
+
+        void PlayAt(Vector3 pos)
+        {
+            _played = true;
+            AudioOneShotPool.Play(sfx, pos, volume, spatialBlend, minDistance, maxDistance);
+        }
+    }
+}
+
+
+using UnityEngine;
+
+namespace ShadowRunners.Audio
+{
+    /// <summary>
+    /// Plays a one-shot when the coin is collected.
+    /// - Triggers on player enter, OR if the coin is disabled near the player (magnet).
+    /// - Uses AudioOneShotPool instead of spawning/destroying GameObjects.
+    /// </summary>
+    [AddComponentMenu("ShadowRunners/Audio/Coin Pickup SFX")]
+    public class CoinPickupSFX : MonoBehaviour
+    {
+        [Header("Sound")]
+        public AudioClip sfx;
+        [Range(0f, 1f)] public float volume = 0.9f;
+
+        [Header("3D Settings (0 = 2D)")]
+        [Range(0f, 1f)] public float spatialBlend = 0.2f;
+        public float minDistance = 5f;
+        public float maxDistance = 20f;
+
+        [Header("Magnet/Pooling Guard")]
+        [Tooltip("If the coin is disabled within this radius of the player and no SFX has played yet, play it.")]
+        public float playOnDisableNearPlayerRadius = 6f;
+        [Tooltip("Ignore disables that happen immediately on spawn (pooling).")]
+        public float minLifetimeBeforeDisableS = 0.03f;
+
+        bool _played;
+        float _spawnT;
+
+        void OnEnable()
+        {
+            _spawnT = Time.unscaledTime;
+            _played = false;
+        }
+
+        void OnTriggerEnter(Collider other)
+        {
+            if (_played || !sfx) return;
+            if (other && other.CompareTag("Player"))
+                PlayAt(transform.position);
+        }
+
+        void OnDisable()
+        {
+            if (_played || !sfx) return;
+
+            // If we were disabled very quickly, likely pooled despawn � skip.
+            if (Time.unscaledTime - _spawnT < minLifetimeBeforeDisableS) return;
+
+            var player = GameObject.FindGameObjectWithTag("Player");
+            if (!player) return;
+
+            float d = Vector3.Distance(player.transform.position, transform.position);
+            if (d <= playOnDisableNearPlayerRadius)
+                PlayAt(transform.position);
+        }
+
+        /// <summary>Call from other scripts/UnityEvents if you have a collection hook.</summary>
+        public void PlaySFX()
+        {
+            if (!_played && sfx) PlayAt(transform.position);
+        }
+
+        void PlayAt(Vector3 pos)
+        {
+            _played = true;
+            AudioOneShotPool.Play(sfx, pos, volume, spatialBlend, minDistance, maxDistance);
+        }
+    }
+}
+
+
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace ShadowRunners.Gameplay
+{
+    public class GameManager : MonoBehaviour
+    {
+        public static GameManager Instance { get; private set; }
+
+        public enum GameState { Running, Paused, GameOver }
+        public GameState State { get; private set; } = GameState.Running;
+
+        [Header("UI Panels")]
+        [Tooltip("CanvasGroup of the full-screen Game Over overlay. If left empty, we auto-find 'GameOverPanel'.")]
+        public CanvasGroup gameOverPanel;
+
+        private RunnerMotor _runner;
+        private TrackManager _track;
+        private ShadowRunners.Systems.ScoreSystem _score;
+
+        private void Awake()
+        {
+            if (Instance && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+
+            _runner = FindObjectOfType<RunnerMotor>();
+            _track = FindObjectOfType<TrackManager>();
+            _score = FindObjectOfType<ShadowRunners.Systems.ScoreSystem>();
+
+            if (!gameOverPanel)
+            {
+                var go = GameObject.Find("GameOverPanel");
+                if (go) gameOverPanel = go.GetComponent<CanvasGroup>();
+            }
+
+            Time.timeScale = 1f;
+            HidePanel(gameOverPanel);
+        }
+
+        private void Start()
+        {
+            HidePanel(gameOverPanel); // double-safety
+        }
+
+        public void PlayerHitObstacle()
+        {
+            if (State == GameState.GameOver) return;
+
+            State = GameState.GameOver;
+            Time.timeScale = 0f;
+
+            if (_runner) _runner.enabled = false;
+            if (_track) _track.enabled = false;
+
+            if (_score) _score.OnRunEnded();
+
+            ShowPanel(gameOverPanel);
+        }
+
+        public void TogglePause()
+        {
+            if (State == GameState.GameOver) return;
+
+            if (State == GameState.Running) PauseGame();
+            else if (State == GameState.Paused) ResumeGame();
+        }
+
+        public void PauseGame()
+        {
+            if (State != GameState.Running) return;
+            State = GameState.Paused;
+            Time.timeScale = 0f;
+        }
+
+        public void ResumeGame()
+        {
+            if (State != GameState.Paused) return;
+            State = GameState.Running;
+            Time.timeScale = 1f;
+        }
+
+        public void RestartRun()
+        {
+            Time.timeScale = 1f;
+            SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
+        }
+
+        private void Update()
+        {
+            if (State != GameState.GameOver)
+            {
+                if (Input.GetKeyDown(KeyCode.Escape) || Input.GetKeyDown(KeyCode.P))
+                    TogglePause();
+                return;
+            }
+
+            // Restart in Game Over
+            bool keyRestart = Input.GetKeyDown(KeyCode.R) || Input.GetKeyDown(KeyCode.Space) || Input.GetMouseButtonDown(0);
+            bool touchRestart = Input.touchCount > 0 && (Input.GetTouch(0).phase == TouchPhase.Began);
+            if (keyRestart || touchRestart) RestartRun();
+        }
+
+        private static void ShowPanel(CanvasGroup cg)
+        {
+            if (!cg) return;
+            cg.alpha = 1f; cg.interactable = true; cg.blocksRaycasts = true;
+        }
+        private static void HidePanel(CanvasGroup cg)
+        {
+            if (!cg) return;
+            cg.alpha = 0f; cg.interactable = false; cg.blocksRaycasts = false;
+        }
+    }
+}
+
+
+
+

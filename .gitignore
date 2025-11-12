@@ -1,0 +1,179 @@
+# ------------------------------
+# Unity (base template)
+# Source: https://github.com/github/gitignore/blob/main/Unity.gitignore
+# ------------------------------
+.utmp/
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+*.log
+
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# Uncomment if you use the old Asset Store Tools
+# /[Aa]ssets/AssetStoreTools*
+
+/[Aa]ssets/Plugins/Editor/JetBrains*
+
+.vs/
+.gradle/
+ExportedObj/
+.consulo/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity generated meta files (binary pdb variants)
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Crash/diagnostics
+sysinfo.txt
+
+# Build artifacts
+*.apk
+*.aab
+*.unitypackage
+*.unitypackage.meta
+*.app
+
+# Crashlytics
+crashlytics-build.properties
+
+# Packed Addressables
+/[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/*/*.bin*
+
+# Temporary auto-generated Android Assets
+/[Aa]ssets/[Ss]treamingAssets/aa.meta
+/[Aa]ssets/[Ss]treamingAssets/aa/*
+
+
+# ---------------------------------------------------------
+# Code-first repo polishing (keep code/scenes; skip heavy art)
+# ---------------------------------------------------------
+
+# 1) INCLUDE all code/text assets we want visible in the repo
+#    (Patterns are negations: they RE-include files even if a parent rule ignores something.)
+
+# C# and assembly defs
+!Assets/**/*.cs
+!Assets/**/*.asmdef
+!Assets/**/*.asmref
+
+# Shaders & text-based resources
+!Assets/**/*.shader
+!Assets/**/*.hlsl
+!Assets/**/*.cginc
+!Assets/**/*.compute
+!Assets/**/*.json
+!Assets/**/*.xml
+!Assets/**/*.yaml
+!Assets/**/*.yml
+!Assets/**/*.txt
+!Assets/**/*.bytes
+!Assets/**/*.ini
+!Assets/**/*.uss
+!Assets/**/*.uxml
+
+# Unity text-based assets you usually want in a code-first repo
+!Assets/**/*.unity
+!Assets/**/*.prefab
+!Assets/**/*.mat
+!Assets/**/*.anim
+!Assets/**/*.controller
+!Assets/**/*.overrideController
+!Assets/**/*.asset
+!Assets/**/*.spriteatlas
+!Assets/**/*.lighting
+!Assets/**/*.postprocessingprofile
+!Assets/**/*.inputactions
+!Assets/**/*.physicMaterial
+!Assets/**/*.physicsMaterial
+
+# 2) EXCLUDE heavy binary art/audio/video anywhere under Assets
+#    (These are the typical "big" files that cause push trouble. We also ignore their .meta files.)
+
+# Images / textures
+Assets/**/*.[Pp][Nn][Gg]
+Assets/**/*.[Jj][Pp][Ee][Gg]
+Assets/**/*.[Jj][Pp][Gg]
+Assets/**/*.[Tt][Gg][Aa]
+Assets/**/*.[Tt][Ii][Ff][Ff]
+Assets/**/*.[Ee][Xx][Rr]
+Assets/**/*.[Hh][Dd][Rr]
+Assets/**/*.[Pp][Ss][Dd]
+Assets/**/*.[Aa][Ii]
+Assets/**/*.[Ww][Bb][Pp]
+Assets/**/*.[Kk][Rr][Aa]
+Assets/**/*.[Ss][Kk][Ee][Tt][Cc][Hh]
+
+# 3D models
+Assets/**/*.[Ff][Bb][Xx]
+Assets/**/*.[Oo][Bb][Jj]
+Assets/**/*.[Gg][Ll][Tt][Ff]
+Assets/**/*.[Gg][Ll][Bb]
+Assets/**/*.[Bb][Ll][Ee][Nn][Dd]
+Assets/**/*.[Uu][Ss][Dd][Zz]
+
+# Audio / video
+Assets/**/*.[Ww][Aa][Vv]
+Assets/**/*.[Oo][Gg][Gg]
+Assets/**/*.[Mm][Pp]3
+Assets/**/*.[Mm][Pp]4
+Assets/**/*.[Mm][Oo][Vv]
+Assets/**/*.[Ww][Ee][Bb][Mm]
+Assets/**/*.[Aa][Uu][Dd][Ii][Oo]
+
+# Ignore the .meta files for the heavy binaries above
+Assets/**/*.[Pp][Nn][Gg].meta
+Assets/**/*.[Jj][Pp][Ee][Gg].meta
+Assets/**/*.[Jj][Pp][Gg].meta
+Assets/**/*.[Tt][Gg][Aa].meta
+Assets/**/*.[Tt][Ii][Ff][Ff].meta
+Assets/**/*.[Ee][Xx][Rr].meta
+Assets/**/*.[Hh][Dd][Rr].meta
+Assets/**/*.[Pp][Ss][Dd].meta
+Assets/**/*.[Aa][Ii].meta
+Assets/**/*.[Ww][Bb][Pp].meta
+Assets/**/*.[Kk][Rr][Aa].meta
+Assets/**/*.[Ss][Kk][Ee][Tt][Cc][Hh].meta
+
+Assets/**/*.[Ff][Bb][Xx].meta
+Assets/**/*.[Oo][Bb][Jj].meta
+Assets/**/*.[Gg][Ll][Tt][Ff].meta
+Assets/**/*.[Gg][Ll][Bb].meta
+Assets/**/*.[Bb][Ll][Ee][Nn][Dd].meta
+Assets/**/*.[Uu][Ss][Dd][Zz].meta
+
+Assets/**/*.[Ww][Aa][Vv].meta
+Assets/**/*.[Oo][Gg][Gg].meta
+Assets/**/*.[Mm][Pp]3.meta
+Assets/**/*.[Mm][Pp]4.meta
+Assets/**/*.[Mm][Oo][Vv].meta
+Assets/**/*.[Ww][Ee][Bb][Mm].meta
+Assets/**/*.[Aa][Uu][Dd][Ii][Oo].meta
+
+
+# ---------------------------------------------------------
+# Notes for collaborators / recruiters
+# ---------------------------------------------------------
+# This repo is code-first: large art/audio/video are excluded to keep the repo small and push-friendly.
+# Playable build is available on Itch.io.
+# If you need full assets later, add them via Git LFS or GitHub Releases.
